@@ -818,6 +818,9 @@ int fs_chmod(const char *path, mode_t mode)
  *   - you will have to implement the helper funciont "alloc_blk" first
  *   - when creating a file, remember to initialize the inode ptrs.
  */
+
+
+
 int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     uint32_t cur_time = time(NULL);
@@ -825,11 +828,120 @@ int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     uint16_t uid = ctx->uid;
     uint16_t gid = ctx->gid;
 
-    // get rid of compiling warnings; you should remove later
-    (void) uid, (void) gid, (void) cur_time;
-
     /* your code here */
-    return -EOPNOTSUPP;
+
+    (void)fi;
+
+    char *parent_path = NULL;
+    char *name = NULL;
+    int rv = split_parent_child(path, &parent_path, &name);
+    if (rv < 0) {
+        return rv;
+    }
+
+    if (strlen(name) > 27) {
+        free(parent_path);
+        return -EINVAL;
+    }
+
+    int dir_inum = path2inum(parent_path);
+    free(parent_path);
+    if (dir_inum < 0) {
+        return dir_inum; // ENOENT / ENOTDIR
+    }
+
+    inode_t dir_inode;
+    if (block_read(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+    if (!S_ISDIR(dir_inode.mode)) {
+        return -ENOTDIR;
+    }
+
+    // Ensure directory has a dirent block
+    if (dir_inode.ptrs[0] == 0) {
+        int db = alloc_blk();
+        if (db < 0) {
+            return db;
+        }
+        dir_inode.ptrs[0] = (uint32_t)db;
+        dir_inode.size = FS_BLOCK_SIZE;
+        dir_inode.mtime = cur_time;
+        dir_inode.ctime = cur_time;
+
+        dirent_t empty[NUM_DIRENT_BLOCK];
+        memset(empty, 0, sizeof(empty));
+        if (block_write(empty, db, 1) < 0) {
+            return -EIO;
+        }
+        if (block_write(&dir_inode, dir_inum, 1) < 0) {
+            return -EIO;
+        }
+    }
+
+    dirent_t entries[NUM_DIRENT_BLOCK];
+    if (block_read(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    int free_idx = -1;
+    // check for EEXIST and find free slot
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (entries[i].valid) {
+            if (strcmp(entries[i].name, name) == 0) {
+                return -EEXIST;
+            }
+        } else if (free_idx < 0) {
+            free_idx = i;
+        }
+    }
+
+    if (free_idx < 0) {
+        return -ENOSPC;
+    }
+
+    int new_inum = alloc_blk();
+    if (new_inum < 0) {
+        return new_inum;
+    }
+
+    inode_t in;
+    memset(&in, 0, sizeof(in));
+    in.uid = uid;
+    in.gid = gid;
+    // mode parameter in tests is S_IFREG|perms; we also OR to be safe
+    in.mode = (mode & 0777) | S_IFREG;
+    in.ctime = cur_time;
+    in.mtime = cur_time;
+    in.size = 0;
+    for (int i = 0; i < NUM_PTRS_INODE; i++) {
+        in.ptrs[i] = 0;
+    }
+
+    if (block_write(&in, new_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    entries[free_idx].valid = 1;
+    entries[free_idx].inode = (uint32_t)new_inum;
+    strncpy(entries[free_idx].name, name, 27);
+    entries[free_idx].name[27] = '\0';
+
+    if (block_write(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    // Update parent directory times
+    dir_inode.mtime = cur_time;
+    if (block_read(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+    dir_inode.mtime = cur_time;
+    if (block_write(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 }
 
 
@@ -848,19 +960,100 @@ int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
  *   - there is a lot of similaries between fs_mkdir and fs_create.
  *     you may want to reuse many parts (note: reuse is not copy-paste!)
  */
-int fs_mkdir(const char *path, mode_t mode)
+
+
+int fs_rmdir(const char *path)
 {
     uint32_t cur_time = time(NULL);
-    struct fuse_context *ctx = fuse_get_context();
-    uint16_t uid = ctx->uid;
-    uint16_t gid = ctx->gid;
 
-    // get rid of compiling warnings; you should remove later
-    (void) uid, (void) gid, (void) cur_time;
+    // Do not allow removing root
+    if (strcmp(path, "/") == 0) {
+        return -ENOTEMPTY;
+    }
 
-    /* your code here */
-    return -EOPNOTSUPP;
+    char *parent_path = NULL;
+    char *name = NULL;
+    int rv = split_parent_child(path, &parent_path, &name);
+    if (rv < 0) {
+        return rv;
+    }
+
+    int dir_inum = path2inum(parent_path);
+    free(parent_path);
+    if (dir_inum < 0) {
+        return dir_inum;  // ENOENT / ENOTDIR
+    }
+
+    inode_t dir_inode;
+    if (block_read(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+    if (!S_ISDIR(dir_inode.mode)) {
+        return -ENOTDIR;
+    }
+    if (dir_inode.ptrs[0] == 0) {
+        return -ENOENT;
+    }
+
+    dirent_t entries[NUM_DIRENT_BLOCK];
+    if (block_read(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    int idx = -1;
+    uint32_t child_inum = 0;
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (entries[i].valid && strcmp(entries[i].name, name) == 0) {
+            idx = i;
+            child_inum = entries[i].inode;
+            break;
+        }
+    }
+    if (idx < 0) {
+        return -ENOENT;
+    }
+
+    inode_t child;
+    if (block_read(&child, child_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (!S_ISDIR(child.mode)) {
+        return -ENOTDIR;
+    }
+
+    // Check emptiness: no valid entries in its first block
+    if (child.ptrs[0] != 0) {
+        dirent_t cents[NUM_DIRENT_BLOCK];
+        if (block_read(cents, child.ptrs[0], 1) < 0) {
+            return -EIO;
+        }
+        for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+            if (cents[i].valid) {
+                return -ENOTEMPTY;
+            }
+        }
+    }
+
+    // Free child's data blocks (if any) & inode
+    free_file_blocks(&child);
+    free_blk((int)child_inum);
+
+    // Remove dirent from parent
+    entries[idx].valid = 0;
+    entries[idx].name[0] = '\0';
+    if (block_write(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    dir_inode.mtime = cur_time;
+    if (block_write(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 }
+
 
 
 /* EXERCISE 5:
@@ -873,10 +1066,100 @@ int fs_mkdir(const char *path, mode_t mode)
  *   - remember to delete all data blocks as well
  *   - remember to update "mtime"
  */
+
+static void free_file_blocks(inode_t *in)
+{
+    if (in->size <= 0) {
+        return;
+    }
+    int nblocks = DIV_ROUND_UP(in->size, FS_BLOCK_SIZE);
+    for (int i = 0; i < nblocks && i < NUM_PTRS_INODE; i++) {
+        if (in->ptrs[i] != 0) {
+            free_blk((int)in->ptrs[i]);
+            in->ptrs[i] = 0;
+        }
+    }
+    in->size = 0;
+}
+
+
+
 int fs_unlink(const char *path)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+    uint32_t cur_time = time(NULL);
+
+    char *parent_path = NULL;
+    char *name = NULL;
+    int rv = split_parent_child(path, &parent_path, &name);
+    if (rv < 0) {
+        return rv;
+    }
+
+    int dir_inum = path2inum(parent_path);
+    free(parent_path);
+    if (dir_inum < 0) {
+        return dir_inum;  // ENOENT / ENOTDIR
+    }
+
+    inode_t dir_inode;
+    if (block_read(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+    if (!S_ISDIR(dir_inode.mode)) {
+        return -ENOTDIR;
+    }
+    if (dir_inode.ptrs[0] == 0) {
+        return -ENOENT;
+    }
+
+    dirent_t entries[NUM_DIRENT_BLOCK];
+    if (block_read(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    int idx = -1;
+    uint32_t child_inum = 0;
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (entries[i].valid && strcmp(entries[i].name, name) == 0) {
+            idx = i;
+            child_inum = entries[i].inode;
+            break;
+        }
+    }
+    if (idx < 0) {
+        return -ENOENT;
+    }
+
+    inode_t child;
+    if (block_read(&child, child_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (S_ISDIR(child.mode)) {
+        return -EISDIR;
+    }
+
+    // Free data blocks
+    free_file_blocks(&child);
+
+    // Free inode block
+    free_blk((int)child_inum);
+
+    // Remove dirent
+    entries[idx].valid = 0;
+    entries[idx].name[0] = '\0';
+    if (block_write(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    // Update parent mtime
+    dir_inode.mtime = cur_time;
+    if (block_write(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 }
 
 /* EXERCISE 5:
@@ -908,7 +1191,94 @@ int fs_write(const char *path, const char *buf, size_t len,
          off_t offset, struct fuse_file_info *fi)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+
+  (void)fi;
+
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;  // ENOENT / ENOTDIR
+    }
+
+    inode_t in;
+    if (block_read(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+    if (S_ISDIR(in.mode)) {
+        return -EISDIR;
+    }
+
+    if (offset > in.size) {
+        return -EINVAL;   // no holes allowed
+    }
+
+    if (len == 0) {
+        return 0;
+    }
+
+    off_t end_pos = offset + (off_t)len;
+    // Check maximum file size
+    off_t max_size = (off_t)NUM_PTRS_INODE * FS_BLOCK_SIZE;
+    if (end_pos > max_size) {
+        return -ENOSPC;
+    }
+
+    size_t total_written = 0;
+
+    while (total_written < len) {
+        off_t cur_off = offset + (off_t)total_written;
+        int blk_index = (int)(cur_off / FS_BLOCK_SIZE);
+        int blk_off   = (int)(cur_off % FS_BLOCK_SIZE);
+
+        if (blk_index >= NUM_PTRS_INODE) {
+            return -ENOSPC;
+        }
+
+        if (in.ptrs[blk_index] == 0) {
+            int newblk = alloc_blk();
+            if (newblk < 0) {
+                return newblk;
+            }
+            in.ptrs[blk_index] = (uint32_t)newblk;
+
+            // zero block for safety
+            char zero[FS_BLOCK_SIZE];
+            memset(zero, 0, sizeof(zero));
+            if (block_write(zero, newblk, 1) < 0) {
+                return -EIO;
+            }
+        }
+
+        char block[FS_BLOCK_SIZE];
+        if (block_read(block, in.ptrs[blk_index], 1) < 0) {
+            return -EIO;
+        }
+
+        size_t can_copy = FS_BLOCK_SIZE - blk_off;
+        size_t remaining = len - total_written;
+        if (can_copy > remaining) {
+            can_copy = remaining;
+        }
+
+        memcpy(block + blk_off, buf + total_written, can_copy);
+
+        if (block_write(block, in.ptrs[blk_index], 1) < 0) {
+            return -EIO;
+        }
+
+        total_written += can_copy;
+    }
+
+    // Update size and times
+    if (end_pos > in.size) {
+        in.size = (int32_t)end_pos;
+    }
+    in.mtime = (uint32_t)time(NULL);
+
+    if (block_write(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return (int)total_written;
 }
 
 /* EXERCISE 6:
@@ -919,18 +1289,42 @@ int fs_write(const char *path, const char *buf, size_t len,
  * Errors - path resolution, ENOENT, EISDIR, EINVAL
  *    return EINVAL if len > 0.
  */
+
 int fs_truncate(const char *path, off_t len)
 {
-    /* you can cheat by only implementing this for the case of len==0,
-     * and an error otherwise.
-     */
+    /* only support len == 0; anything else is an error */
     if (len != 0) {
-        return -EINVAL;        /* invalid argument */
+        return -EINVAL;
     }
 
-    /* your code here */
-    return -EOPNOTSUPP;
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;              // ENOENT / ENOTDIR
+    }
+
+    inode_t in;
+    if (block_read(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (S_ISDIR(in.mode)) {
+        return -EISDIR;
+    }
+
+    /* discard all data blocks for this file */
+    free_file_blocks(&in);
+
+    uint32_t now = (uint32_t)time(NULL);
+    in.mtime = now;
+    in.ctime = now;               // status change as well
+
+    if (block_write(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 }
+
 
 /* EXERCISE 6:
  * Change file's last modification time.
