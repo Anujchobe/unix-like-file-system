@@ -119,6 +119,23 @@ void free_blk(int i) {
 }
 
 
+static void free_file_blocks(inode_t *in)
+{
+    if (in->size <= 0) {
+        return;
+    }
+    int nblocks = DIV_ROUND_UP(in->size, FS_BLOCK_SIZE);
+    for (int i = 0; i < nblocks && i < NUM_PTRS_INODE; i++) {
+        if (in->ptrs[i] != 0) {
+            free_blk((int)in->ptrs[i]);
+            in->ptrs[i] = 0;
+        }
+    }
+    in->size = 0;
+}
+
+
+
 // === FS helper functions ===
 
 
@@ -962,14 +979,12 @@ int fs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
  */
 
 
-int fs_rmdir(const char *path)
+int fs_mkdir(const char *path, mode_t mode)
 {
-    uint32_t cur_time = time(NULL);
-
-    // Do not allow removing root
-    if (strcmp(path, "/") == 0) {
-        return -ENOTEMPTY;
-    }
+    uint32_t cur_time = (uint32_t)time(NULL);
+    struct fuse_context *ctx = fuse_get_context();
+    uint16_t uid = ctx->uid;
+    uint16_t gid = ctx->gid;
 
     char *parent_path = NULL;
     char *name = NULL;
@@ -978,6 +993,13 @@ int fs_rmdir(const char *path)
         return rv;
     }
 
+    // too-long name (>27) -> -EINVAL
+    if (strlen(name) > 27) {
+        free(parent_path);
+        return -EINVAL;
+    }
+
+    // resolve parent directory
     int dir_inum = path2inum(parent_path);
     free(parent_path);
     if (dir_inum < 0) {
@@ -991,8 +1013,24 @@ int fs_rmdir(const char *path)
     if (!S_ISDIR(dir_inode.mode)) {
         return -ENOTDIR;
     }
+
+    // Ensure parent has a dirent block
     if (dir_inode.ptrs[0] == 0) {
-        return -ENOENT;
+        int db = alloc_blk();
+        if (db < 0) {
+            return db;
+        }
+        dir_inode.ptrs[0] = (uint32_t)db;
+        dir_inode.size = FS_BLOCK_SIZE;
+
+        dirent_t empty[NUM_DIRENT_BLOCK];
+        memset(empty, 0, sizeof(empty));
+        if (block_write(empty, db, 1) < 0) {
+            return -EIO;
+        }
+        if (block_write(&dir_inode, dir_inum, 1) < 0) {
+            return -EIO;
+        }
     }
 
     dirent_t entries[NUM_DIRENT_BLOCK];
@@ -1000,52 +1038,52 @@ int fs_rmdir(const char *path)
         return -EIO;
     }
 
-    int idx = -1;
-    uint32_t child_inum = 0;
+    int free_idx = -1;
+    // Check for existing name (EEXIST) and find free slot
     for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
-        if (entries[i].valid && strcmp(entries[i].name, name) == 0) {
-            idx = i;
-            child_inum = entries[i].inode;
-            break;
+        if (entries[i].valid) {
+            if (strcmp(entries[i].name, name) == 0) {
+                return -EEXIST;
+            }
+        } else if (free_idx < 0) {
+            free_idx = i;
         }
     }
-    if (idx < 0) {
-        return -ENOENT;
+
+    if (free_idx < 0) {
+        return -ENOSPC;
     }
 
-    inode_t child;
-    if (block_read(&child, child_inum, 1) < 0) {
+    // Allocate inode for the new directory
+    int new_inum = alloc_blk();
+    if (new_inum < 0) {
+        return new_inum;
+    }
+
+    inode_t in;
+    memset(&in, 0, sizeof(in));
+    in.uid = uid;
+    in.gid = gid;
+    in.mode = (mode & 0777) | S_IFDIR;  // directory + permissions
+    in.ctime = cur_time;
+    in.mtime = cur_time;
+    // ptrs[] already zero, size = 0 is fine for an empty directory
+
+    if (block_write(&in, new_inum, 1) < 0) {
         return -EIO;
     }
 
-    if (!S_ISDIR(child.mode)) {
-        return -ENOTDIR;
-    }
+    // Install dirent in parent
+    entries[free_idx].valid = 1;
+    entries[free_idx].inode = (uint32_t)new_inum;
+    strncpy(entries[free_idx].name, name, 27);
+    entries[free_idx].name[27] = '\0';
 
-    // Check emptiness: no valid entries in its first block
-    if (child.ptrs[0] != 0) {
-        dirent_t cents[NUM_DIRENT_BLOCK];
-        if (block_read(cents, child.ptrs[0], 1) < 0) {
-            return -EIO;
-        }
-        for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
-            if (cents[i].valid) {
-                return -ENOTEMPTY;
-            }
-        }
-    }
-
-    // Free child's data blocks (if any) & inode
-    free_file_blocks(&child);
-    free_blk((int)child_inum);
-
-    // Remove dirent from parent
-    entries[idx].valid = 0;
-    entries[idx].name[0] = '\0';
     if (block_write(entries, dir_inode.ptrs[0], 1) < 0) {
         return -EIO;
     }
 
+    // Update parent directory mtime
     dir_inode.mtime = cur_time;
     if (block_write(&dir_inode, dir_inum, 1) < 0) {
         return -EIO;
@@ -1053,6 +1091,7 @@ int fs_rmdir(const char *path)
 
     return 0;
 }
+
 
 
 
@@ -1066,22 +1105,6 @@ int fs_rmdir(const char *path)
  *   - remember to delete all data blocks as well
  *   - remember to update "mtime"
  */
-
-static void free_file_blocks(inode_t *in)
-{
-    if (in->size <= 0) {
-        return;
-    }
-    int nblocks = DIV_ROUND_UP(in->size, FS_BLOCK_SIZE);
-    for (int i = 0; i < nblocks && i < NUM_PTRS_INODE; i++) {
-        if (in->ptrs[i] != 0) {
-            free_blk((int)in->ptrs[i]);
-            in->ptrs[i] = 0;
-        }
-    }
-    in->size = 0;
-}
-
 
 
 int fs_unlink(const char *path)
@@ -1173,7 +1196,95 @@ int fs_unlink(const char *path)
 int fs_rmdir(const char *path)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+
+      uint32_t cur_time = (uint32_t)time(NULL);
+
+    // don’t allow removing root
+    if (strcmp(path, "/") == 0) {
+        return -ENOTEMPTY;
+    }
+
+    char *parent_path = NULL;
+    char *name = NULL;
+    int rv = split_parent_child(path, &parent_path, &name);
+    if (rv < 0) {
+        return rv;
+    }
+
+    int dir_inum = path2inum(parent_path);
+    free(parent_path);
+    if (dir_inum < 0) {
+        return dir_inum;          // ENOENT / ENOTDIR
+    }
+
+    inode_t dir_inode;
+    if (block_read(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+    if (!S_ISDIR(dir_inode.mode)) {
+        return -ENOTDIR;
+    }
+    if (dir_inode.ptrs[0] == 0) {
+        return -ENOENT;
+    }
+
+    dirent_t entries[NUM_DIRENT_BLOCK];
+    if (block_read(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    int idx = -1;
+    uint32_t child_inum = 0;
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (entries[i].valid && strcmp(entries[i].name, name) == 0) {
+            idx = i;
+            child_inum = entries[i].inode;
+            break;
+        }
+    }
+    if (idx < 0) {
+        return -ENOENT;
+    }
+
+    inode_t child;
+    if (block_read(&child, child_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (!S_ISDIR(child.mode)) {
+        return -ENOTDIR;
+    }
+
+    // Check that directory is empty: no valid entries
+    if (child.ptrs[0] != 0) {
+        dirent_t cents[NUM_DIRENT_BLOCK];
+        if (block_read(cents, child.ptrs[0], 1) < 0) {
+            return -EIO;
+        }
+        for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+            if (cents[i].valid) {
+                return -ENOTEMPTY;
+            }
+        }
+    }
+
+    // Free the directory’s data blocks and inode block
+    free_file_blocks(&child);
+    free_blk((int)child_inum);
+
+    // Remove dirent from parent
+    entries[idx].valid = 0;
+    entries[idx].name[0] = '\0';
+    if (block_write(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    dir_inode.mtime = cur_time;
+    if (block_write(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 }
 
 /* EXERCISE 6:
