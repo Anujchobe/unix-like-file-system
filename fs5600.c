@@ -20,7 +20,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <assert.h>
-#include <time.h>
+#include <utime.h>
 
 #include "fs5600.h"
 
@@ -1452,7 +1452,31 @@ int fs_truncate(const char *path, off_t len)
 int fs_utime(const char *path, struct utimbuf *ut)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+
+  int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;            // ENOENT / ENOTDIR
+    }
+
+    inode_t in;
+    if (block_read(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    uint32_t new_mtime;
+    if (ut == NULL) {
+        new_mtime = (uint32_t)time(NULL);
+    } else {
+        new_mtime = (uint32_t)ut->modtime;
+    }
+
+    in.mtime = new_mtime;       // only mtime needs to be updated
+
+    if (block_write(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
 
 }
 
