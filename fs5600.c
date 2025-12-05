@@ -23,6 +23,12 @@
 
 #include "fs5600.h"
 
+// === Global in-memory filesystem state ===
+
+static super_t superblock;                 // cached superblock (block 0)
+static unsigned char block_bitmap[FS_BLOCK_SIZE];  // cached bitmap (block 1)
+
+
 /* if you don't understand why you can't use these system calls here,
  * you need to read the assignment description another time
  */
@@ -73,6 +79,23 @@ int bit_test(unsigned char *map, int i)
  */
 int alloc_blk() {
     /* Your code here */
+
+     // Scan all blocks and find a free one (bit = 0)
+    // We are allowed to allocate any block; blocks 0 and 1 are already
+    // marked used in the bitmap created by gen-disk.py.
+    for (uint32_t i = 0; i < superblock.disk_size; i++) {
+        if (!bit_test(block_bitmap, i)) {
+            bit_set(block_bitmap, i);
+            // write updated bitmap back to disk (block 1)
+            if (block_write(block_bitmap, 1, 1) < 0) {
+                // undo the bit in memory so we don’t lie to ourselves
+                bit_clear(block_bitmap, i);
+                return -EIO;
+            }
+            return (int)i;
+        }
+    }
+    return -ENOSPC;
     return -ENOSPC;
 }
 
@@ -84,6 +107,14 @@ int alloc_blk() {
  */
 void free_blk(int i) {
     /* your code here*/
+
+      if (i < 0 || (uint32_t)i >= superblock.disk_size) {
+        return;     // silently ignore bad input
+    }
+    bit_clear(block_bitmap, i);
+    // We can’t return an error from here, so just assert success.
+    // If there’s an I/O error, tests will fail loudly, which is fine.
+    assert(block_write(block_bitmap, 1, 1) == 0);
 }
 
 
@@ -217,6 +248,26 @@ void inode2stat(struct stat *sb, struct fs_inode *in, uint32_t inode_num)
 void* fs_init(struct fuse_conn_info *conn)
 {
     /* your code here */
+
+      (void)conn;  // unused
+
+    // Read superblock (block 0)
+    if (block_read(&superblock, 0, 1) < 0) {
+        fprintf(stderr, "fs_init: failed to read superblock\n");
+        exit(1);
+    }
+
+    if (superblock.magic != FS_MAGIC) {
+        fprintf(stderr, "fs_init: bad magic number 0x%x (expected 0x%x)\n",
+                superblock.magic, FS_MAGIC);
+        exit(1);
+    }
+
+    // Read block bitmap (block 1) into memory
+    if (block_read(block_bitmap, 1, 1) < 0) {
+        fprintf(stderr, "fs_init: failed to read block bitmap\n");
+        exit(1);
+    }
     return NULL;
 }
 
@@ -243,7 +294,38 @@ int fs_statfs(const char *path, struct statvfs *st)
     st->f_namemax = 27;  // why? see fs5600.h
 
     /* your code here */
-    return -EOPNOTSUPP;
+    (void)path;  // we don’t care which path; stats are for the whole FS
+
+    st->f_bsize = FS_BLOCK_SIZE;
+    st->f_frsize = FS_BLOCK_SIZE;  // fragment size – same as block size here
+    st->f_namemax = 27;            // max filename length (see fs5600.h)
+
+    uint32_t total_blocks = superblock.disk_size;
+
+    if (total_blocks <= 2) {
+        // pathological case: no space beyond super + bitmap
+        st->f_blocks = 0;
+        st->f_bfree = 0;
+        st->f_bavail = 0;
+        return 0;
+    }
+
+    // Total usable blocks for inodes + data, excluding superblock (0) and bitmap (1)
+    st->f_blocks = total_blocks - 2;
+
+    // Count free blocks among [2, total_blocks)
+    unsigned long free_count = 0;
+    for (uint32_t i = 2; i < total_blocks; i++) {
+        if (!bit_test(block_bitmap, i)) {
+            free_count++;
+        }
+    }
+
+    st->f_bfree  = free_count;
+    st->f_bavail = free_count;
+
+    // You can leave other fields (f_files, f_ffree, etc.) as 0.
+    return 0;
 }
 
 
