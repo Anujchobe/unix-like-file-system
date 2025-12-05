@@ -96,7 +96,7 @@ int alloc_blk() {
         }
     }
     return -ENOSPC;
-    return -ENOSPC;
+   
 }
 
 /*
@@ -172,7 +172,67 @@ void free_blk(int i) {
 
 int path2inum(const char *path) {
     /* your code here */
-    return 0;
+
+      // Root path
+    if (strcmp(path, "/") == 0) {
+        return 2;   // root inode is always block 2
+    }
+
+    // Make a writable copy of path
+    char *copy = strdup(path);
+    if (!copy) {
+        return -ENOMEM;
+    }
+
+    int cur_inum = 2;  // start at root
+    char *saveptr = NULL;
+    char *tok = strtok_r(copy, "/", &saveptr);
+
+    while (tok != NULL) {
+        inode_t cur_inode;
+        // Read current inode block
+        if (block_read(&cur_inode, cur_inum, 1) < 0) {
+            free(copy);
+            return -EIO;
+        }
+
+        // Current must be a directory to look up children
+        if (!S_ISDIR(cur_inode.mode)) {
+            free(copy);
+            return -ENOTDIR;
+        }
+
+        // Directory must have a data block
+        if (cur_inode.ptrs[0] == 0) {
+            free(copy);
+            return -ENOENT;
+        }
+
+        dirent_t entries[NUM_DIRENT_BLOCK];
+        if (block_read(entries, cur_inode.ptrs[0], 1) < 0) {
+            free(copy);
+            return -EIO;
+        }
+
+        int found = 0;
+        for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+            if (entries[i].valid && strcmp(entries[i].name, tok) == 0) {
+                cur_inum = entries[i].inode;
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found) {
+            free(copy);
+            return -ENOENT;
+        }
+
+        tok = strtok_r(NULL, "/", &saveptr);
+    }
+
+    free(copy);
+    return cur_inum;
 }
 
 
@@ -223,6 +283,34 @@ void inode2stat(struct stat *sb, struct fs_inode *in, uint32_t inode_num)
     memset(sb, 0, sizeof(*sb));
 
     /* your code here */
+
+    sb->st_ino   = inode_num;
+    sb->st_mode  = in->mode;
+    sb->st_nlink = 1;            // no hard links in fs5600
+    sb->st_uid   = in->uid;
+    sb->st_gid   = in->gid;
+    sb->st_size  = in->size;
+
+    // Number of FS blocks the file logically occupies
+    if (in->size > 0) {
+        int blocks = DIV_ROUND_UP(in->size, FS_BLOCK_SIZE);
+        sb->st_blocks = blocks * (FS_BLOCK_SIZE / 512);  // 512-byte units
+    } else {
+        sb->st_blocks = 0;
+    }
+
+    // Times: our inode stores seconds since epoch
+    sb->st_mtime = in->mtime;
+    sb->st_ctime = in->ctime;
+    sb->st_atime = in->mtime;    // no atime stored, reuse mtime
+
+    // Also fill timespec fields (if present on this libc)
+    sb->st_mtim.tv_sec = in->mtime;
+    sb->st_mtim.tv_nsec = 0;
+    sb->st_ctim.tv_sec = in->ctime;
+    sb->st_ctim.tv_nsec = 0;
+    sb->st_atim.tv_sec = in->mtime;
+    sb->st_atim.tv_nsec = 0;
 }
 
 
@@ -350,7 +438,20 @@ int fs_statfs(const char *path, struct statvfs *st)
 int fs_getattr(const char *path, struct stat *sb)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+
+  
+        int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;   // already a negative errno
+    }
+
+    inode_t in;
+    if (block_read(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    inode2stat(sb, &in, (uint32_t)inum);
+    return 0;
 }
 
 /* EXERCISE 2:
@@ -378,7 +479,42 @@ int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
                off_t offset, struct fuse_file_info *fi)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+
+      (void)offset;
+    (void)fi;
+
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;   // ENOENT or ENOTDIR
+    }
+
+    inode_t dir_inode;
+    if (block_read(&dir_inode, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (!S_ISDIR(dir_inode.mode)) {
+        return -ENOTDIR;
+    }
+
+    // Empty directory? No entries to list.
+    if (dir_inode.ptrs[0] == 0) {
+        return 0;
+    }
+
+    dirent_t entries[NUM_DIRENT_BLOCK];
+    if (block_read(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (entries[i].valid) {
+            // test1.c's filler ignores stbuf, so we can pass NULL
+            filler(ptr, entries[i].name, NULL, 0);
+        }
+    }
+
+    return 0;
 }
 
 
