@@ -666,7 +666,7 @@ int fs_rename(const char *src_path, const char *dst_path)
 {
     /* your code here */
 
-      char *src_parent = NULL, *dst_parent = NULL;
+char *src_parent = NULL, *dst_parent = NULL;
     char *src_name = NULL, *dst_name = NULL;
 
     int rv = split_parent_child(src_path, &src_parent, &src_name);
@@ -679,28 +679,34 @@ int fs_rename(const char *src_path, const char *dst_path)
         return rv;
     }
 
-    // Source and destination must be in the same directory
-    if (strcmp(src_parent, dst_parent) != 0) {
-        free(src_parent);
-        free(dst_parent);
-        return -EINVAL;
-    }
-
-    // Too-long name is invalid (>27)
+    // Too-long destination name is invalid (>27)
     if (strlen(dst_name) > 27) {
         free(src_parent);
         free(dst_parent);
         return -EINVAL;
     }
 
-    // Find parent directory inode
-    int dir_inum = path2inum(src_parent);
+    // Resolve parent directories first
+    int src_dir_inum = path2inum(src_parent);
+    int dst_dir_inum = path2inum(dst_parent);
+
     free(src_parent);
     free(dst_parent);
 
-    if (dir_inum < 0) {
-        return dir_inum;   // ENOENT / ENOTDIR
+    // If either parent path is bad, propagate that error
+    if (src_dir_inum < 0) {
+        return src_dir_inum;      // ENOENT / ENOTDIR
     }
+    if (dst_dir_inum < 0) {
+        return dst_dir_inum;      // ENOENT / ENOTDIR
+    }
+
+    // Now both parents exist. If they differ → EINVAL (cross-dir rename not allowed)
+    if (src_dir_inum != dst_dir_inum) {
+        return -EINVAL;
+    }
+
+    int dir_inum = src_dir_inum;
 
     inode_t dir_inode;
     if (block_read(&dir_inode, dir_inum, 1) < 0) {
