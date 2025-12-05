@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <assert.h>
+#include <time.h>
 
 #include "fs5600.h"
 
@@ -530,7 +531,69 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
         struct fuse_file_info *fi)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+
+      (void)fi;
+
+    int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;   // ENOENT or ENOTDIR
+    }
+
+    inode_t in;
+    if (block_read(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    if (S_ISDIR(in.mode)) {
+        return -EISDIR;
+    }
+
+    // If offset beyond end of file, nothing to read
+    if (offset >= in.size) {
+        return 0;
+    }
+
+    // Clamp len so we don't read past EOF
+    size_t max_can_read = (size_t)(in.size - offset);
+    if (len > max_can_read) {
+        len = max_can_read;
+    }
+    if (len == 0) {
+        return 0;
+    }
+
+    size_t total_read = 0;
+
+    while (total_read < len) {
+        off_t cur_off = offset + total_read;
+        int blk_index = (int)(cur_off / FS_BLOCK_SIZE);
+        int blk_off   = (int)(cur_off % FS_BLOCK_SIZE);
+
+        if (blk_index >= NUM_PTRS_INODE) {
+            break; // inconsistent inode; stop
+        }
+
+        uint32_t blkno = in.ptrs[blk_index];
+        if (blkno == 0) {
+            break; // hole / inconsistency
+        }
+
+        char block[FS_BLOCK_SIZE];
+        if (block_read(block, blkno, 1) < 0) {
+            return -EIO;
+        }
+
+        size_t can_copy = FS_BLOCK_SIZE - blk_off;
+        size_t remaining = len - total_read;
+        if (can_copy > remaining) {
+            can_copy = remaining;
+        }
+
+        memcpy(buf + total_read, block + blk_off, can_copy);
+        total_read += can_copy;
+    }
+
+    return (int)total_read;
 }
 
 
@@ -549,10 +612,133 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
  * particular, the full version can move across directories, replace a
  * destination file, and replace an empty directory with a full one.
  */
+
+/* Helper: split an absolute path into parent directory and name.
+ * For example: "/dir2/file.4k+" -> parent="/dir2", name="file.4k+"
+ *              "/file.1k"      -> parent="/",    name="file.1k"
+ * Caller must free(*parent_out) and *name_out is a pointer into that string.
+ */
+static int split_parent_child(const char *path, char **parent_out, char **name_out)
+{
+    if (strcmp(path, "/") == 0) {
+        return -EINVAL;  // can't rename root
+    }
+
+    char *copy = strdup(path);
+    if (!copy) return -ENOMEM;
+
+    char *slash = strrchr(copy, '/');
+    if (!slash) {
+        free(copy);
+        return -EINVAL; // all our paths are absolute, so this shouldn't happen
+    }
+
+    char *name = slash + 1;
+    if (*name == '\0') {
+        // trailing slash case like "/dir/"; not expected in tests
+        free(copy);
+        return -EINVAL;
+    }
+
+    if (slash == copy) {
+        // parent is root "/"
+        *(slash + 1) = '\0';   // keep "/" + '\0'
+    } else {
+        *slash = '\0';         // terminate parent string at slash
+    }
+
+    *parent_out = copy;
+    *name_out = name;
+    return 0;
+}
+
+
+
 int fs_rename(const char *src_path, const char *dst_path)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+
+      char *src_parent = NULL, *dst_parent = NULL;
+    char *src_name = NULL, *dst_name = NULL;
+
+    int rv = split_parent_child(src_path, &src_parent, &src_name);
+    if (rv < 0) {
+        return rv;
+    }
+    rv = split_parent_child(dst_path, &dst_parent, &dst_name);
+    if (rv < 0) {
+        free(src_parent);
+        return rv;
+    }
+
+    // Source and destination must be in the same directory
+    if (strcmp(src_parent, dst_parent) != 0) {
+        free(src_parent);
+        free(dst_parent);
+        return -EINVAL;
+    }
+
+    // Too-long name is invalid (>27)
+    if (strlen(dst_name) > 27) {
+        free(src_parent);
+        free(dst_parent);
+        return -EINVAL;
+    }
+
+    // Find parent directory inode
+    int dir_inum = path2inum(src_parent);
+    free(src_parent);
+    free(dst_parent);
+
+    if (dir_inum < 0) {
+        return dir_inum;   // ENOENT / ENOTDIR
+    }
+
+    inode_t dir_inode;
+    if (block_read(&dir_inode, dir_inum, 1) < 0) {
+        return -EIO;
+    }
+    if (!S_ISDIR(dir_inode.mode)) {
+        return -ENOTDIR;
+    }
+    if (dir_inode.ptrs[0] == 0) {
+        return -ENOENT;    // empty dir, nothing to rename
+    }
+
+    dirent_t entries[NUM_DIRENT_BLOCK];
+    if (block_read(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    // Find source entry
+    int src_idx = -1;
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (entries[i].valid && strcmp(entries[i].name, src_name) == 0) {
+            src_idx = i;
+            break;
+        }
+    }
+    if (src_idx < 0) {
+        return -ENOENT;
+    }
+
+    // Check if destination name already exists
+    for (int i = 0; i < NUM_DIRENT_BLOCK; i++) {
+        if (entries[i].valid && strcmp(entries[i].name, dst_name) == 0) {
+            return -EEXIST;
+        }
+    }
+
+    // Perform rename: change the name in the src entry
+    strncpy(entries[src_idx].name, dst_name, 27);
+    entries[src_idx].name[27] = '\0';
+
+    if (block_write(entries, dir_inode.ptrs[0], 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
+    
 }
 
 /* EXERCISE 3:
@@ -571,7 +757,30 @@ int fs_rename(const char *src_path, const char *dst_path)
 int fs_chmod(const char *path, mode_t mode)
 {
     /* your code here */
-    return -EOPNOTSUPP;
+      int inum = path2inum(path);
+    if (inum < 0) {
+        return inum;   // ENOENT etc
+    }
+
+    inode_t in;
+    if (block_read(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    // 'mode' only contains permission bits. Preserve type bits.
+    uint32_t type_bits = in.mode & S_IFMT;
+    uint32_t perm_bits = mode & 0777;
+    in.mode = type_bits | perm_bits;
+
+    // Update ctime to now
+    in.ctime = (uint32_t)time(NULL);
+
+    if (block_write(&in, inum, 1) < 0) {
+        return -EIO;
+    }
+
+    return 0;
+    
 }
 
 
