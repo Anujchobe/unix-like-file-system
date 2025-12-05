@@ -613,44 +613,52 @@ int fs_read(const char *path, char *buf, size_t len, off_t offset,
  * destination file, and replace an empty directory with a full one.
  */
 
+
 /* Helper: split an absolute path into parent directory and name.
  * For example: "/dir2/file.4k+" -> parent="/dir2", name="file.4k+"
  *              "/file.1k"      -> parent="/",    name="file.1k"
- * Caller must free(*parent_out) and *name_out is a pointer into that string.
+ * Caller must free(*parent_out). name_out points into the original path.
  */
 static int split_parent_child(const char *path, char **parent_out, char **name_out)
 {
     if (strcmp(path, "/") == 0) {
-        return -EINVAL;  // can't rename root
+        return -EINVAL;  // can't split root
     }
 
-    char *copy = strdup(path);
-    if (!copy) return -ENOMEM;
-
-    char *slash = strrchr(copy, '/');
-    if (!slash) {
-        free(copy);
-        return -EINVAL; // all our paths are absolute, so this shouldn't happen
+    const char *last = strrchr(path, '/');
+    if (!last) {
+        return -EINVAL;  // paths should always be absolute
     }
 
-    char *name = slash + 1;
+    const char *name = last + 1;
     if (*name == '\0') {
         // trailing slash case like "/dir/"; not expected in tests
-        free(copy);
         return -EINVAL;
     }
 
-    if (slash == copy) {
-        // parent is root "/"
-        *(slash + 1) = '\0';   // keep "/" + '\0'
+    char *parent = NULL;
+    if (last == path) {
+        // Parent is just "/"
+        parent = strdup("/");
     } else {
-        *slash = '\0';         // terminate parent string at slash
+        size_t plen = (size_t)(last - path);
+        parent = malloc(plen + 1);
+        if (!parent) {
+            return -ENOMEM;
+        }
+        memcpy(parent, path, plen);
+        parent[plen] = '\0';
     }
 
-    *parent_out = copy;
-    *name_out = name;
+    if (!parent) {
+        return -ENOMEM;
+    }
+
+    *parent_out = parent;
+    *name_out = (char *)name;  // safe: we don't modify *name
     return 0;
 }
+
 
 
 
