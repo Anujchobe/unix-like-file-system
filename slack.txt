@@ -1,6 +1,6 @@
-Name:
-NUID:
-slack days used: 0
-remaining slack days: 5
+Name: Anuj K Chobe
+NUID: 002072562
+slack days used: 1
+remaining slack days: 4
 Challenge I (optional): No
 Challenge II (optional): No
